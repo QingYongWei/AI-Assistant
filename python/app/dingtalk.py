@@ -9,7 +9,7 @@ from .config import home,load_config
 from .logging_config import configure_logger,log_file_path
 from .database import SessionLocal
 from .models import Task,SubTask,Approval,EventLog,Job,AgentRun
-from .state_machine import transition
+from .state_machine import transition,status_label
 from .queue import SqliteQueue
 from .task_ids import semantic_task_id
 from .intents import interpret_intent,_looks_like_task_supplement
@@ -68,7 +68,7 @@ def _route_decision(action: str,executor: str) -> str:
     action=str(action or 'unknown')
     if action=='chat': return 'cloud-model generated chat reply'
     if action=='inspect': return 'path-whitelist -> local read-only agent'
-    if action=='create': return 'task queue -> local agent planner -> human approval'
+    if action=='create': return 'task queue -> planner -> clarification-or-auto-execute'
     if action=='supplement': return 'append task context and queue revision for local agent re-execution'
     if action=='help': return 'built-in help text'
     if action=='identity': return 'built-in identity text'
@@ -149,8 +149,8 @@ def _priority_ack_text(action,cmd):
             '',
             '接下来我会：',
             '1. 创建语义任务 ID 并加入规划队列',
-            '2. 规划完成后主动推送审批通知',
-            '3. 你批准后调用本地 Codex/Claude 执行',
+            '2. 需求明确时自动调用本地 Codex/Claude 执行，不再等待人工审批',
+            '3. 信息不足时向你追问，你的后续回复会自动并入当前任务上下文',
             '4. 执行、验证完成或失败后主动推送结果',
         ]
         if project: lines.append('\n项目/工作目录：'+project)
@@ -171,6 +171,17 @@ def _priority_ack_text(action,cmd):
             '4. 修订执行、验证完成或失败后主动推送结果',
         ]
         return '\n'.join(lines)
+    if action=='clarify':
+        answer=str(cmd.get('answer') or cmd.get('requirement') or '').strip()
+        if not answer: return None
+        return '\n'.join([
+            '已把这条回复识别为当前任务的澄清答复：',
+            answer[:600],
+            '',
+            f'目标任务：{cmd.get("task_id") or "LATEST"}',
+            '',
+            '接下来我会带着完整上下文重新规划；需求明确后自动进入执行。',
+        ])
     if action=='external_command':
         instruction=str(cmd.get('instruction') or '').strip()
         if not instruction: return None
@@ -201,6 +212,17 @@ _ACTIVE_TASK_STATUSES = {
     'EXECUTING', 'VERIFYING', 'REPAIRING', 'WAITING_FOR_HUMAN', 'COMPLETED',
 }
 
+
+def _clarification_binding(active_task,text):
+    """任务等待澄清时，把普通回复强制绑定到该任务，避免被误判为新任务或闲聊。"""
+    if active_task and active_task.get('status')=='WAITING_FOR_CLARIFICATION' and str(text or '').strip():
+        return {
+            'action':'clarify',
+            'task_id':active_task.get('public_id') or 'LATEST',
+            'answer':str(text).strip(),
+            'confidence':0.95,
+        }
+    return None
 
 def _active_task_context():
     """Return a secret-free snapshot of the newest non-terminal PersonZit task."""
@@ -417,16 +439,16 @@ def notify_task_event(event,task,extra_lines=None):
     """关键节点通知：approval/clarification/completed/waiting_human/failed。"""
     cfg=load_config().get('dingtalk',{})
     if not cfg.get('notify',{}).get(event,True): return
-    title={'approval':'📝 待审批','clarification':'❓ 需要澄清','completed':'✅ 任务完成',
+    title={'approval':'📝 待审批','clarification':'❓ 需要澄清','auto_started':'🚀 自动开始执行','completed':'✅ 任务完成',
            'waiting_human':'🧑‍💻 等待人工介入','failed':'❌ 任务失败'}.get(event,event)
-    lines=[f'### {title}',f'**任务**：{task.public_id} {task.title}',f'**状态**：{task.status}']
+    lines=[f'### {title}',f'**任务**：{task.public_id} {task.title}',f'**状态**：{status_label(task.status)}']
     if task.plan_json:
         try:
             plan=json.loads(task.plan_json)
             if plan.get('summary'): lines.append(f'**摘要**：{plan["summary"]}')
             qs=plan.get('clarification_questions') or []
             if event=='clarification' and qs:
-                lines+=['','**请回答以下问题（回复：澄清 %s 你的答复）**'%task.public_id]+[f'{i+1}. {q}' for i,q in enumerate(qs)]
+                lines+=['',f'**请回答以下问题（直接回复内容即可，也可回复：澄清 {task.public_id} 你的答复）**']+[f'{i+1}. {q}' for i,q in enumerate(qs)]
             if event=='approval':
                 lines+=['',f'**风险等级**：{plan.get("risk_level","medium")}','**批准**：回复 `通过 {task.public_id}`','**驳回**：回复 `驳回 {task.public_id} 理由`']
         except Exception: pass
@@ -494,10 +516,10 @@ def parse_message(text):
 
 HELP_TEXT='''PersonZit 钉钉用法：
 身份                            查看 userId / conversationId
-任务 <需求描述> [项目=D:\路径]  发布工程任务
+任务 <需求描述> [项目=D:\路径]  发布工程任务（明确自动执行，不明确会追问）
 通过 <任务ID> [理由]             批准计划
 驳回 <任务ID> <理由>             驳回重新规划
-澄清 <任务ID> <答复>             回复澄清问题
+澄清 <任务ID> <答复>             回复澄清问题（等待澄清时直接回复也可）
 补充 <任务ID> <补充/纠错>        修订当前任务上下文
 状态 <任务ID>                    查询任务
 运行                            查看 PersonZit 队列和手动 Codex/Claude 会话
@@ -523,10 +545,13 @@ def _get_task(db,task_id,statuses=None):
         return db.scalar(query)
     return db.scalar(select(Task).where(Task.public_id==task_id))
 
+def _job_status_label(status):
+    return {'QUEUED':'排队中','RUNNING':'执行中','SUCCEEDED':'已完成','FAILED':'失败','RETRY_WAIT':'等待重试'}.get(str(status or ''),str(status or ''))
+
 def _format_external_session(record):
     summary=str(record.get('summary') or '').strip()
     if summary: summary=summary[:800]
-    lines=[f'{record.get("external_id")} [{record.get("status")}] {record.get("agent")} 手动会话',
+    lines=[f'{record.get("external_id")} [{external_agents._external_status_label(record.get("status"))}] {record.get("agent")} 手动会话',
            f'任务：{record.get("title") or "未记录任务标题"}']
     if record.get('workspace'): lines.append(f'目录：{record["workspace"]}')
     lines.append(f'原始会话：{record.get("session_id")}')
@@ -542,7 +567,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
             if action=='help': return HELP_TEXT
             if action=='list':
                 tasks=db.scalars(select(Task).order_by(Task.id.desc()).limit(5)).all()
-                return '最近任务：\n'+'\n'.join(f'{t.public_id} [{t.status}] {t.title[:40]}' for t in tasks) or '暂无任务'
+                return '最近任务：\n'+'\n'.join(f'{t.public_id} [{status_label(t.status)}] {t.title[:40]}' for t in tasks) or '暂无任务'
             if action=='running':
                 jobs=db.scalars(select(Job).where(Job.status.in_(['QUEUED','RUNNING'])).order_by(Job.id.desc()).limit(20)).all()
                 live=process_registry.active_tasks()
@@ -553,7 +578,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 if externals:
                     lines.append('手动 Codex/Claude 会话：')
                     for record in externals[:10]:
-                        lines.append(f'- {record["external_id"]} [{record["status"]}] {record["agent"]} / {(record.get("title") or "")[:100]} / {record.get("workspace") or "未记录目录"}')
+                        lines.append(f'- {record["external_id"]} [{external_agents._external_status_label(record["status"])}] {record["agent"]} / {(record.get("title") or "")[:100]} / {record.get("workspace") or "未记录目录"}')
                         lines.append(f'  指挥：指挥 {record["external_id"]} <修订要求>')
                 for job in jobs:
                     task=db.get(Task,job.task_id)
@@ -562,7 +587,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                     if job.locked_at:
                         locked_at=job.locked_at.replace(tzinfo=timezone.utc) if job.locked_at and job.locked_at.tzinfo is None else job.locked_at
                         duration=f'，已运行 {round((datetime.now(timezone.utc)-locked_at).total_seconds())}s'
-                    lines.append(f'- {task.public_id} [{task.status}] {job.job_type} / {job.status}{duration} / {job.locked_by or "未领取"} / {task.project_path}')
+                    lines.append(f'- {task.public_id} [{status_label(task.status)}] {job.job_type} / {_job_status_label(job.status)}{duration} / {job.locked_by or "未领取"} / {task.project_path}')
                     run=db.scalar(select(AgentRun).where(AgentRun.task_id==task.id,AgentRun.status=='RUNNING').order_by(AgentRun.id.desc()))
                     if run:
                         sub=db.get(SubTask,run.subtask_id)
@@ -575,7 +600,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 t=_get_task(db,cmd['task_id'])
                 if not t: return f'未找到 {cmd["task_id"]}'
                 if t.status in ('CANCELLED','COMPLETED','FAILED'):
-                    return f'{t.public_id} 已经是终态 {t.status}，无需结束'
+                    return f'{t.public_id} 已经是终态（{status_label(t.status)}），无需结束'
                 terminated=process_registry.request_cancel(t.public_id)
                 transition(db,t,'CANCEL_REQUESTED',actor=actor,reason=cmd.get('reason') or 'dingtalk cancel requested')
                 active_jobs=db.scalars(select(Job).where(Job.task_id==t.id,Job.status=='RUNNING')).all()
@@ -593,7 +618,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 t=_get_task(db,cmd['task_id'])
                 if not t: return f'未找到 {cmd["task_id"]}'
                 subs=db.scalars(select(SubTask).where(SubTask.task_id==t.id).order_by(SubTask.order_index)).all()
-                lines=[f'{t.public_id} {t.title}',f'状态：{t.status}',f'项目：{t.project_path}']
+                lines=[f'{t.public_id} {t.title}',f'状态：{status_label(t.status)}',f'项目：{t.project_path}']
                 if t.plan_json:
                     try:
                         p=json.loads(t.plan_json)
@@ -613,7 +638,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 }
                 if t.status in next_actions: lines.append(next_actions[t.status])
                 elif t.status in ('CANCELLED','COMPLETED','FAILED'): lines.append('该任务已是终态。')
-                lines+=['子任务：']+[f'- {s.public_id} [{s.status}] {s.title}' for s in subs]
+                lines+=['子任务：']+[f'- {s.public_id} [{status_label(s.status)}] {s.title}' for s in subs]
                 return '\n'.join(lines)
             if action=='create':
                 project=cmd.get('project') or load_config().get('dingtalk',{}).get('default_project')
@@ -625,12 +650,12 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':req[:80],'description':req,'project_path':project},ensure_ascii=False))
                 _log_route(message_id,stage='task-created',action='create',task_id=t.public_id,
                     workspace=project,outcome='queued',next_stage='PLAN_TASK')
-                return f'已创建 {t.public_id}，正在规划，稍后需要人工审批'
+                return f'已创建 {t.public_id}，正在规划；需求明确会自动进入执行，信息不足时会继续向你追问'
             if action=='supplement':
                 t=_get_task(db,cmd.get('task_id') or 'LATEST')
                 if not t: return f'未找到要补充的任务 {cmd.get("task_id") or "LATEST"}'
                 if t.status in ('CANCELLED','FAILED'):
-                    return f'{t.public_id} 已是终态 {t.status}，不能追加修订。请重新发布任务'
+                    return f'{t.public_id} 已是终态（{status_label(t.status)}），不能追加修订。请重新发布任务'
                 reopened=False
                 if t.status=='COMPLETED':
                     transition(db,t,'REPAIRING',actor=actor,reason='dingtalk supplement reopened completed task')
@@ -649,8 +674,12 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                     transition(db,t,'ANALYZING',actor=actor,reason='dingtalk supplement requires replanning')
                     SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':t.title,'description':t.description,'project_path':t.project_path},ensure_ascii=False)); db.commit()
                     return f'已把补充规则并入 {t.public_id}，将重新规划后再审批'
-                if t.status in ('WAITING_FOR_CLARIFICATION','WAITING_FOR_HUMAN','PAUSED'):
-                    return f'已记录 {t.public_id} 的补充要求。当前状态为 {t.status}，需要你按原流程回复后才会继续执行'
+                if t.status=='WAITING_FOR_CLARIFICATION':
+                    transition(db,t,'ANALYZING',actor=actor,reason='dingtalk supplement treated as clarification answer')
+                    SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':t.title,'description':t.description,'project_path':t.project_path,'answers':[requirement]},ensure_ascii=False)); db.commit()
+                    return f'已把补充内容并入 {t.public_id} 的澄清上下文，正在重新规划；需求明确后会自动进入执行'
+                if t.status in ('WAITING_FOR_HUMAN','PAUSED'):
+                    return f'已记录 {t.public_id} 的补充要求。当前状态为{status_label(t.status)}，需要你按原流程回复后才会继续执行'
                 SqliteQueue(db).enqueue('REVISE_TASK',t.id,payload=json.dumps({'requirement':requirement},ensure_ascii=False),priority=100)
                 db.commit()
                 return f'已记录 {t.public_id} 的补充要求，并排入修订队列；当前 Agent 完成本轮后会带新规则重跑相关子任务' if not reopened else f'已重新打开 {t.public_id}，补充规则已入修订队列，将带新规则重跑相关子任务'
@@ -681,10 +710,10 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 if t.status=='PAUSED':
                     target=t.paused_from or 'QUEUED'
                     transition(db,t,target,actor=actor,reason='dingtalk continue resumed')
-                    db.commit(); return f'{t.public_id} 已恢复为 {t.status}'
+                    db.commit(); return f'{t.public_id} 已恢复为{status_label(t.status)}'
                 if t.status in ('CANCELLED','COMPLETED','FAILED'):
-                    return f'{t.public_id} 已是终态 {t.status}，不能继续。可重新发布任务'
-                return f'{t.public_id} 正在 {t.status}，无需重复触发。可发送“运行”查看详细链路'
+                    return f'{t.public_id} 已是终态（{status_label(t.status)}），不能继续。可重新发布任务'
+                return f'{t.public_id} 正在{status_label(t.status)}，无需重复触发。可发送“运行”查看详细链路'
             if action=='approve':
                 t=_get_task(db,cmd['task_id'],['WAITING_FOR_APPROVAL','WAITING_FOR_HUMAN'])
                 if not t: return f'未找到待审批任务 {cmd["task_id"]}'
@@ -699,7 +728,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                     transition(db,t,'VERIFYING',actor=actor,reason='钉钉批准高风险验收')
                     SqliteQueue(db).enqueue('VERIFY_SUBTASK',t.id,payload=json.dumps({'approval_id':va.id,'approved_command':command},ensure_ascii=False)); db.commit()
                     return f'{t.public_id} 高风险验收已批准，继续验证'
-                if t.status!='WAITING_FOR_APPROVAL': return f'{t.public_id} 当前状态为 {t.status}，无法批准'
+                if t.status!='WAITING_FOR_APPROVAL': return f'{t.public_id} 当前状态为{status_label(t.status)}，无法批准'
                 transition(db,t,'QUEUED',actor=actor,reason=cmd.get('reason') or 'dingtalk approved')
                 t.approved_at=datetime.now(timezone.utc)
                 a=db.scalar(select(Approval).where(Approval.task_id==t.id,Approval.status=='PENDING').order_by(Approval.id.desc()))
@@ -709,7 +738,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
             if action=='reject':
                 t=_get_task(db,cmd['task_id'],['WAITING_FOR_APPROVAL'])
                 if not t: return f'未找到 {cmd["task_id"]}'
-                if t.status!='WAITING_FOR_APPROVAL': return f'{t.public_id} 当前状态为 {t.status}，无法驳回'
+                if t.status!='WAITING_FOR_APPROVAL': return f'{t.public_id} 当前状态为{status_label(t.status)}，无法驳回'
                 a=db.scalar(select(Approval).where(Approval.task_id==t.id,Approval.status=='PENDING').order_by(Approval.id.desc()))
                 if a: a.status='REJECTED'; a.comment=cmd.get('reason'); a.resolved_at=datetime.now(timezone.utc)
                 transition(db,t,'ANALYZING',actor=actor,reason=cmd.get('reason') or 'dingtalk rejected')
@@ -718,10 +747,18 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
             if action=='clarify':
                 t=_get_task(db,cmd['task_id'])
                 if not t: return f'未找到 {cmd["task_id"]}'
-                if t.status!='WAITING_FOR_CLARIFICATION': return f'{t.public_id} 当前状态为 {t.status}，无需澄清'
+                if t.status!='WAITING_FOR_CLARIFICATION': return f'{t.public_id} 当前状态为{status_label(t.status)}，无需澄清'
+                answer=str(cmd.get('answer') or cmd.get('requirement') or '').strip()
+                if not answer: return f'请提供 {t.public_id} 的澄清答复内容'
+                marker='\n\n## 钉钉澄清答复\n'
+                existing=t.description or ''
+                if answer not in existing:
+                    t.description=(existing+marker+'- '+answer).strip()
+                db.add(EventLog(task_id=t.id,event_type='TASK_CLARIFICATION_RECEIVED',actor_type='human',actor_id=actor,
+                    payload_json=json.dumps({'answer':answer,'source_message_id':message_id},ensure_ascii=False)))
                 transition(db,t,'ANALYZING',actor=actor,reason='dingtalk clarification')
-                SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'answers':[cmd['answer']]},ensure_ascii=False))
-                db.commit(); return f'{t.public_id} 已收到澄清答复，正在重新规划'
+                SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':t.title,'description':t.description,'project_path':t.project_path,'answers':[answer]},ensure_ascii=False))
+                db.commit(); return f'{t.public_id} 已收到澄清答复，正在重新规划；需求明确后会自动进入执行'
         return '未知指令'
     except Exception as e: return f'指令执行失败：{e}'
 
@@ -815,7 +852,7 @@ def start_stream_service():
                         with SessionLocal() as db:
                             pending=db.scalar(select(Task).where(Task.status.in_(['WAITING_FOR_APPROVAL','WAITING_FOR_CLARIFICATION','WAITING_FOR_HUMAN'])).order_by(Task.id.desc()).limit(1))
                         if pending:
-                            reply=(f'收到一条空文本消息。当前最新等待任务：{pending.public_id}（{pending.status}）。\n'
+                            reply=(f'收到一条空文本消息。当前最新等待任务：{pending.public_id}（{status_label(pending.status)}）。\n'
                                    f'如需批准请回复：通过 {pending.public_id}\n如需查看请回复：状态 {pending.public_id}')
                         else:
                             reply='收到一条空文本消息。请发送文字内容；如果使用引用、卡片或富文本，请同时包含文字说明。'
@@ -833,7 +870,19 @@ def start_stream_service():
                             parser='exact-rules',action=cmd.get('action'))
                     else:
                         active_task=_active_task_context()
-                        if active_task and _looks_like_task_supplement(text):
+                        # 任务等待澄清时，普通补充内容必须绑定当前任务：
+                        # 无论模型是否误判为 chat/create，都不能拆成新任务或普通聊天。
+                        clarification_reply=_clarification_binding(active_task,text)
+                        if clarification_reply:
+                            cmd=clarification_reply
+                            intent_meta={
+                                'provider':'clarification-context',
+                                'model':'active-task-context',
+                                'task_id':cmd['task_id'],
+                            }
+                            _log_route(message_id,stage='intent-precheck',text=text,outcome='matched',
+                                parser='clarification-context',action='clarify',task_id=cmd['task_id'])
+                        elif active_task and _looks_like_task_supplement(text):
                             cmd={
                                 'action':'supplement',
                                 'task_id':active_task.get('public_id') or 'LATEST',
@@ -855,7 +904,11 @@ def start_stream_service():
                             _log_route(message_id,stage='intent-start',text=text,processor='natural-language',
                                 provider=nl_provider,model=nl_cfg.get('model') or 'configured-default')
                             cmd,intent_meta=await asyncio.to_thread(interpret_intent,text,_get_conversation_history(sender,conv),active_task)
-                        if action_if_defined(cmd) in ('chat','unknown') and active_task and _looks_like_task_supplement(text):
+                        clarification_reply=_clarification_binding(active_task,text)
+                        if clarification_reply and action_if_defined(cmd) in ('chat','unknown','create','supplement'):
+                            cmd=clarification_reply
+                            intent_meta={'provider':'clarification-context-rescue','model':'active-task-context','task_id':cmd['task_id']}
+                        elif action_if_defined(cmd) in ('chat','unknown') and active_task and _looks_like_task_supplement(text):
                             cmd={'action':'supplement','task_id':active_task.get('public_id') or 'LATEST','requirement':text.strip(),'confidence':0.9}
                             intent_meta={'provider':'task-context-rescue','model':'active-task-context','task_id':cmd['task_id']}
                     intent_duration_ms=round((time.monotonic()-intent_started)*1000)

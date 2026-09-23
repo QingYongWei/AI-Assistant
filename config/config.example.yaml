@@ -73,6 +73,7 @@ dingtalk:
     api_key_env: ZHIPU_API_KEY
     timeout_seconds: 30
   notify:
+    auto_started: true
     approval: true
     clarification: true
     completed: true

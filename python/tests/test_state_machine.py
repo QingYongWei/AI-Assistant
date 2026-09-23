@@ -1,4 +1,4 @@
-﻿from app.state_machine import transition
+from app.state_machine import transition
 from app.models import Task
 def test_transition_records_event():
     class DB:
@@ -12,3 +12,10 @@ def test_waiting_for_human_can_resume_to_verifying():
     t=Task(status='WAITING_FOR_HUMAN',public_id='TASK-1',title='x',description='x',project_path='.')
     db=DB(); transition(db,t,'VERIFYING',reason='approved')
     assert t.status=='VERIFYING'
+
+
+def test_status_label_returns_chinese():
+    from app.state_machine import status_label
+    assert status_label('WAITING_FOR_CLARIFICATION')=='等待澄清'
+    assert status_label('EXECUTING')=='执行中'
+    assert status_label('SOMETHING_NEW')=='SOMETHING_NEW'

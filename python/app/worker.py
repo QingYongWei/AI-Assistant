@@ -273,6 +273,18 @@ def handle_plan(db,task,job):
         transition(db,task,'WAITING_FOR_CLARIFICATION',actor='worker',reason='需求信息不足，等待澄清'); db.commit()
         notify_task_event('clarification',task); return
     transition(db,task,'PLAN_PROPOSED',actor='worker',reason=f'{planner_name} 规划完成')
+    # 钉钉群消息任务：需求明确时不再等待人工审批，直接进入执行阶段。
+    # CLI/API 任务保留原审批模式，便于本地高风险操作仍可人工把关。
+    if str(task.source or '').lower()=='dingtalk':
+        transition(db,task,'QUEUED',actor='system',reason='钉钉任务需求明确，自动进入执行')
+        task.approved_at=datetime.now(timezone.utc)
+        log_event(db,task,'AUTO_STARTED',{'reason':'requirement is clear','source':task.source,'planner':planner_name})
+        db.commit()
+        SqliteQueue(db).enqueue('EXECUTE_SUBTASK',task.id)
+        notify_task_event('auto_started',task)
+        _task_route(task,'planner-auto-start',executor=planner_provider,model=planner_model,
+            outcome='queued',next_stage='EXECUTE_SUBTASK',risk_level=plan.get('risk_level'))
+        return
     transition(db,task,'WAITING_FOR_APPROVAL',actor='worker',reason='approval required')
     db.add(Approval(task_id=task.id,request_reason='计划需要人工批准',risk_level=plan.get('risk_level','medium'),
         request_payload_json=json.dumps(plan,ensure_ascii=False)))

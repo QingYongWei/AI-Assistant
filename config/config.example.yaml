@@ -88,6 +88,13 @@ dingtalk:
       - 'D:\AiWorkspace'
       - 'D:\Workspace'
       - 'D:\Docworkspace'
+external_monitor:
+  enabled: true
+  notify_started: true
+  notify_claude_updates: true
+  # Claude 会话输出合并推送：静默 90 秒后只推最后一条摘要；持续活跃超过 15 分钟也强制推一条。
+  claude_update_quiet_seconds: 90
+  claude_update_max_wait_seconds: 900
 workspace:
   root: 'D:\Workspace\PersonZit'  # default fully authorized workspace
   # current-branch-except-master: work directly on the project branch; isolate only master.

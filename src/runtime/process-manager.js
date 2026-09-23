@@ -9,6 +9,16 @@ import { projectRoot, paths } from './paths.js';
 const py = () => process.env.PERSONZIT_PYTHON || (process.platform === 'win32'
   ? path.join(paths().venv, 'Scripts', 'python.exe') : path.join(paths().venv, 'bin', 'python'));
 
+// Python 3.14 的 venv python.exe 是 venvlauncher 蹦床：它会把基础解释器作为子进程再拉起一次，
+// 且不透传"无控制台"创建参数。后台（detached，无控制台）启动时，Windows 会为内层进程分配
+// 新控制台，弹出的两个空终端窗口一旦被用户关闭就会杀掉真正的 api/worker。
+// pythonw 属于 GUI 子系统、永不分配控制台，stdout/stderr 管道与退出码仍正常穿透蹦床。
+const backgroundPython = () => {
+  if (process.env.PERSONZIT_PYTHON || process.platform !== 'win32') return py();
+  const pythonw = path.join(paths().venv, 'Scripts', 'pythonw.exe');
+  return fs.existsSync(pythonw) ? pythonw : py();
+};
+
 const serviceName = module => module.endsWith('worker') ? 'worker' : 'api';
 const readConfig = () => {
   try { return yaml.parse(fs.readFileSync(paths().config, 'utf8')) || {}; } catch { return {}; }
@@ -80,7 +90,7 @@ export function spawnService(module, foreground = false) {
   fs.mkdirSync(directory, { recursive: true });
   fs.mkdirSync(paths().runtime, { recursive: true });
   const file = logFile(service);
-  const child = spawn(py(), ['-m', module], {
+  const child = spawn(foreground ? py() : backgroundPython(), ['-m', module], {
     cwd: path.join(projectRoot, 'python'),
     detached: !foreground,
     stdio: foreground ? 'inherit' : ['ignore', 'pipe', 'pipe'],

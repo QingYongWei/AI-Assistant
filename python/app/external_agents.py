@@ -55,19 +55,43 @@ def _state_path(state_home: Path|None) -> Path:
     return (state_home or personzit_home())/'runtime'/'external-agent-monitor.json'
 
 
-def _load_state(state_home: Path|None=None) -> dict:
-    path=_state_path(state_home)
-    try:
-        value=json.loads(path.read_text(encoding='utf8'))
-        if isinstance(value,dict) and isinstance(value.get('sessions'),dict): return value
-    except (OSError,ValueError,TypeError):
-        pass
+def _empty_state() -> dict:
     return {'version':1,'next_external_sequence':1,'sessions':{},'pending_notifications':[]}
 
+def _load_state(state_home: Path|None=None) -> dict:
+    """Load monitor state; fall back to the backup if the primary file is torn.
+
+    Windows 上状态文件可能被杀毒/备份/并读短暂锁住。以前一旦读到半截 JSON
+    就返回空状态并继续保存，会把全部会话重置为 baseline，导致进行中的
+    task_started/task_complete 被当成历史吞掉（多窗口时表现为漏通知）。
+    """
+    path=_state_path(state_home)
+    found_any=False
+    for candidate in (path,path.with_name(path.name+'.bak')):
+        try:
+            if not candidate.exists(): continue
+            found_any=True
+            value=json.loads(candidate.read_text(encoding='utf8'))
+            if isinstance(value,dict) and isinstance(value.get('sessions'),dict): return value
+        except (OSError,ValueError,TypeError):
+            continue
+    state=_empty_state()
+    # 只有“文件存在但解析失败”才视为不可读；全新环境没有状态文件属正常初始化。
+    if found_any: state['unreadable']=True
+    return state
 
 def _save_state(state: dict,state_home: Path|None=None) -> None:
+    """Atomically replace the state file and keep the previous copy as backup."""
     path=_state_path(state_home); path.parent.mkdir(parents=True,exist_ok=True)
-    path.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf8',newline='')
+    tmp=path.with_name(path.name+'.tmp')
+    payload=dict(state); payload.pop('unreadable',None)
+    tmp.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf8',newline='')
+    backup=path.with_name(path.name+'.bak')
+    try:
+        if path.exists(): os.replace(path,backup)
+    except OSError:
+        pass
+    os.replace(tmp,path)
 
 
 def _settings() -> dict:
@@ -78,6 +102,10 @@ def _settings() -> dict:
         'list_hours':max(1,int(cfg.get('list_hours',24))),
         'notify_started':bool(cfg.get('notify_started',True)),
         'notify_claude_updates':bool(cfg.get('notify_claude_updates',True)),
+        # Claude 每条 end-turn 输出不再立即推送：静默 quiet 秒后合并为一条；
+        # 持续活跃超过 max_wait 秒也强制推一条，避免长任务全程无更新。
+        'claude_update_quiet_seconds':max(30,int(cfg.get('claude_update_quiet_seconds',90))),
+        'claude_update_max_wait_seconds':max(120,int(cfg.get('claude_update_max_wait_seconds',900))),
         'command_timeout_seconds':max(30,int(cfg.get('command_timeout_seconds',1800))),
     }
 
@@ -216,9 +244,9 @@ def _apply_claude_event(record: dict,event: dict,notify_updates: bool=True) -> E
     if not text: return None
     record['cwd']=str(event.get('cwd') or record.get('cwd') or '')
     record['summary']=text
-    # Claude has no reliable terminal marker when background subagents can resume the
-    # same conversation. Every end-turn visible text is therefore reported as a stage
-    # update; the next user/task notification naturally starts a new monitored turn.
+    # Claude 没有可靠的“本轮结束”标记（后台 subagent 可能续写同一会话）。
+    # 每条 end-turn 输出仍会更新会话状态，但通知在 scan_external_agents
+    # 中按会话缓冲合并，等输出静默后只推最后一条，避免逐步推理刷屏。
     record['status']='WAITING_INPUT_OR_BACKGROUND'
     record['updated_at']=timestamp; record['last_event_at']=timestamp
     if not notify_updates: return None
@@ -236,7 +264,11 @@ def scan_external_agents(user_home: Path|None=None,state_home: Path|None=None) -
     if not settings['enabled']: return [],[]
     user_home=Path(user_home or Path.home())
     with _LOCK:
-        state=_load_state(state_home); sessions=state['sessions']
+        state=_load_state(state_home)
+        if state.get('unreadable'):
+            # 主/备状态均不可读：宁可本轮不扫描，也不能用空状态覆盖真实进度。
+            return [],[]
+        sessions=state['sessions']
         candidates:list[tuple[str,Path,str,str]]=[]
         for path in _codex_files(user_home,settings['lookback_hours']):
             session_id,originator,cwd=_codex_metadata(path)
@@ -282,10 +314,28 @@ def scan_external_agents(user_home: Path|None=None,state_home: Path|None=None) -
                 if record.get('status')=='DISCOVERED': record['status']='IDLE'
                 record['updated_at']=record.get('updated_at') or _utcnow().isoformat()
                 if record['agent']=='claude' and not record.get('manual'):
-                    sessions.pop(key,None); continue
+                    # 保留 IGNORED 记录而不是从状态中删除：删除会导致每轮扫描
+                    # 重新发现、重新编号并重复 baseline（EXT ID 漂移 + 序号膨胀）。
+                    record['status']='IGNORED'
+                elif record.get('status')=='RUNNING' and settings['notify_started']:
+                    # 发现时会话已在运行（例如用户刚打开的多个 Codex 窗口）：
+                    # 历史可以静默基线化，但进行中任务的 started 必须补发通知。
+                    for item in produced:
+                        if item.kind!='started': continue
+                        pending.append({
+                            'kind':'started','agent':item.agent,'external_id':item.external_id,
+                            'session_id':item.session_id,'title':record.get('title') or item.title,
+                            'workspace':item.workspace,'summary':item.summary,'status':item.status,
+                        })
             else:
                 for item in produced:
                     if item.kind=='started' and not settings['notify_started']: continue
+                    if item.kind=='update':
+                        # 每条 end-turn 输出先缓冲（保留最早入队时间），不立即推送。
+                        buffered=record.get('pending_update') or {'buffered_at':_utcnow().isoformat()}
+                        buffered['summary']=item.summary
+                        record['pending_update']=buffered
+                        continue
                     pending.append({
                         'kind':item.kind,'agent':item.agent,'external_id':item.external_id,
                         'session_id':item.session_id,'title':item.title,'workspace':item.workspace,
@@ -295,6 +345,23 @@ def scan_external_agents(user_home: Path|None=None,state_home: Path|None=None) -
                     for item in pending:
                         if item.get('external_id')==record.get('external_id') and item.get('kind')=='started':
                             item['title']=record['title']
+        # 会话静默（或活跃超过 max_wait）后，把缓冲的 update 合并为一条通知。
+        now=time.time()
+        for record in sessions.values():
+            buffered=record.get('pending_update')
+            if not buffered: continue
+            last=_parse_ts(record.get('last_event_at'))
+            last_age=now-(last.timestamp() if last else 0)
+            buffered_at=_parse_ts(buffered.get('buffered_at'))
+            buffered_age=now-(buffered_at.timestamp() if buffered_at else 0)
+            if last_age>=settings['claude_update_quiet_seconds'] or buffered_age>=settings['claude_update_max_wait_seconds']:
+                pending.append({
+                    'kind':'update','agent':record['agent'],'external_id':record['external_id'],
+                    'session_id':record['session_id'],'title':record.get('title') or '',
+                    'workspace':record.get('cwd') or '','summary':buffered.get('summary') or '',
+                    'status':record.get('status'),
+                })
+                record.pop('pending_update',None)
         # Keep bounded state; old sessions remain queryable by ID until pruned.
         if len(sessions)>500:
             ordered=sorted(sessions.items(),key=lambda kv:str(kv[1].get('last_event_at') or ''),reverse=True)
@@ -305,6 +372,7 @@ def scan_external_agents(user_home: Path|None=None,state_home: Path|None=None) -
         cutoff=time.time()-settings['list_hours']*3600
         snapshots=[]
         for record in sessions.values():
+            if record.get('status')=='IGNORED': continue
             try: recent=Path(record.get('path') or '').stat().st_mtime>=cutoff
             except OSError: recent=False
             if recent: snapshots.append(_record_snapshot(record))
@@ -316,7 +384,10 @@ def scan_external_agents(user_home: Path|None=None,state_home: Path|None=None) -
 def drain_external_notifications(state_home: Path|None=None,sender: Callable[[str,str],bool]|None=None) -> list[dict]:
     """Send queued notifications; only successful sends are removed."""
     with _LOCK:
-        state=_load_state(state_home); pending=state.setdefault('pending_notifications',[])
+        state=_load_state(state_home)
+        if state.get('unreadable'):
+            return []
+        pending=state.setdefault('pending_notifications',[])
         remaining=[]
         for item in pending:
             title,markdown=notification_message(item)
@@ -327,6 +398,35 @@ def drain_external_notifications(state_home: Path|None=None,sender: Callable[[st
         return [x for x in pending if x not in remaining]
 
 
+_EXTERNAL_STATUS_LABELS={
+    'RUNNING':'执行中',
+    'COMPLETED':'已完成',
+    'WAITING_INPUT_OR_BACKGROUND':'等待输入或后台运行',
+    'IDLE':'空闲',
+    'DISCOVERED':'已发现',
+    'IGNORED':'已忽略',
+    'INTERRUPTED':'已中断',
+}
+
+def _external_status_label(status) -> str:
+    value=str(status or '')
+    return _EXTERNAL_STATUS_LABELS.get(value,value)
+
+def _distill(text,limit=400) -> str:
+    """提纯通知正文：去代码块与 markdown 修饰，只保留前几行可读文本。"""
+    value=re.sub(r'```[\s\S]*?```','（代码已省略）',str(text or ''))
+    value=re.sub(r'`([^`\n]+)`',r'\1',value)
+    lines=[]
+    for raw in value.splitlines():
+        line=re.sub(r'^\s{0,3}#{1,6}\s+','',raw)
+        line=re.sub(r'^\s*[-*+]\s+','',line)
+        line=re.sub(r'^\s*>\s?','',line).strip()
+        if line: lines.append(line)
+    if len(lines)>3: lines=lines[:3]+['…']
+    body='\n'.join(lines)
+    return body[:limit].rstrip()+('…' if len(body)>limit else '')
+
+
 def notification_message(event: dict) -> tuple[str,str]:
     agent=str(event.get('agent') or 'agent').upper()
     external_id=str(event.get('external_id') or '')
@@ -335,12 +435,12 @@ def notification_message(event: dict) -> tuple[str,str]:
     lines=[
         f'### {label}',
         f'**会话**：`{external_id}` ({agent})',
-        f'**任务**：{str(event.get("title") or "未记录任务标题")[:300]}',
+        f'**任务**：{_distill(event.get("title") or "未记录任务标题",80)}',
     ]
     if event.get('workspace'): lines.append(f'**工作目录**：{event["workspace"]}')
-    if event.get('status'): lines.append(f'**状态**：{event["status"]}')
-    summary=str(event.get('summary') or '').strip()
-    if summary: lines+=['',summary[:1800]]
+    if event.get('status'): lines.append(f'**状态**：{_external_status_label(event["status"])}')
+    summary=_distill(event.get('summary'),400)
+    if summary: lines+=['',summary]
     lines+=['',f'进一步指挥：回复 `指挥 {external_id} <修订要求>`']
     return f'{external_id} {agent} 手动任务','\n\n'.join(lines)
 
@@ -350,6 +450,7 @@ def list_external_sessions(state_home: Path|None=None,max_age_hours: int|None=No
     with _LOCK:
         state=_load_state(state_home); cutoff=time.time()-hours*3600; result=[]
         for record in state.get('sessions',{}).values():
+            if record.get('status')=='IGNORED': continue
             try: recent=Path(record.get('path') or '').stat().st_mtime>=cutoff
             except OSError: recent=False
             if recent: result.append(_record_snapshot(record))

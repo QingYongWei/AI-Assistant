@@ -1,0 +1,98 @@
+server:
+  host: 127.0.0.1
+  port: 8765
+worker:
+  poll_interval_seconds: 1
+  stale_after_seconds: 300
+logging:
+  directory: logs
+  level: INFO
+  retention_days: 30
+ai_providers:
+  zhipu:
+    model: ''
+  bailian:
+    model: ''
+planner:
+  # Supervisor mode: local Codex/Claude generates the engineering plan.
+  provider: local
+  type: ai
+  agent: codex
+  timeout_seconds: 300
+agents:
+  default: mock
+  mock:
+    enabled: true
+  codex:
+    enabled: false
+    executable: codex
+    arguments:
+    - exec
+    - --sandbox
+    - workspace-write
+    - '{prompt}'
+    timeout_seconds: 1800
+  claude:
+    enabled: false
+    executable: claude
+    arguments:
+    - -p
+    - '{prompt}'
+    - --permission-mode
+    - acceptEdits
+    timeout_seconds: 1800
+  zcode:
+    enabled: false
+    executable: zcode
+    arguments:
+    - '{prompt}'
+    timeout_seconds: 1800
+  deepseek:
+    enabled: false
+    executable: deepseek
+    arguments:
+    - '{prompt}'
+    timeout_seconds: 1800
+dingtalk:
+  enabled: false
+  webhook: ''
+  secret: ''
+  client_id: ''
+  client_secret: ''
+  allowed_users: []
+  allowed_conversations: []
+  default_project: 'D:\Workspace\PersonZit'
+  natural_language:
+    enabled: true
+    provider: local          # local agents / bailian / zhipu / openai_compatible
+    # Bailian must use the standard pay-as-you-go API. Do not use a Coding Plan/Token Plan key or endpoint here.
+    model: ''                  # zhipu 推荐 GLM-5.3-FlashX
+    max_tokens: 768
+    temperature: 0
+    base_url: ''
+    api_key_env: ZHIPU_API_KEY
+    timeout_seconds: 30
+  notify:
+    approval: true
+    clarification: true
+    completed: true
+    waiting_human: true
+    failed: true
+  local_actions:
+    enabled: true
+    agent: codex             # codex uses read-only; claude uses plan mode
+    timeout_seconds: 300
+    default_path: 'D:\Workspace'
+    allowed_roots:
+      - 'D:\AiWorkspace'
+      - 'D:\Workspace'
+      - 'D:\Docworkspace'
+workspace:
+  root: 'D:\Workspace\PersonZit'  # default fully authorized workspace
+  # current-branch-except-master: work directly on the project branch; isolate only master.
+  # always-worktree: create a Git worktree for every task.
+  isolation_policy: current-branch-except-master
+  tasks: ''                         # empty means <root>\tasks
+  documents: ''                     # empty means <root>\documents
+  initialize_git: true
+  authorize_agents: true

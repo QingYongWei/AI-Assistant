@@ -1,0 +1,14 @@
+{
+  "name": "personzit",
+  "version": "0.1.0",
+  "description": "Local AI engineering task orchestrator",
+  "type": "module",
+  "bin": { "personzit": "bin/personzit.js" },
+  "scripts": { "test": "node --test", "start": "node bin/personzit.js start --foreground" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^14.0.0",
+    "yaml": "^2.8.1"
+  }
+}

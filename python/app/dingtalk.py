@@ -8,7 +8,7 @@ from sqlalchemy import select
 from .config import home,load_config
 from .logging_config import configure_logger,log_file_path
 from .database import SessionLocal
-from .models import Task,SubTask,Approval,EventLog,Job,AgentRun
+from .models import Task,SubTask,Approval,EventLog,Job,AgentRun,VerificationRun
 from .state_machine import transition,status_label
 from .queue import SqliteQueue
 from .task_ids import semantic_task_id
@@ -51,6 +51,8 @@ def _builtin_executor(action: str) -> str:
         'status':'task-db:status',
         'running':'task-db:running-jobs',
         'continue':'task-state-machine:continue',
+        'retry':'task-state-machine:retry',
+        'reverify':'task-state-machine:reverify',
         'workspace':'conversation-state:workspace',
         'set_workspace':'conversation-state:set-workspace',
         'clear_workspace':'conversation-state:clear-workspace',
@@ -76,6 +78,8 @@ def _route_decision(action: str,executor: str) -> str:
     if action=='status': return 'query task status from SQLite'
     if action=='running': return 'query running/queued jobs and live local-agent processes'
     if action=='continue': return 'resolve latest task state and approve/resume when safely allowed'
+    if action=='retry': return 'replan a task stuck waiting for human with all supplements'
+    if action=='reverify': return 're-run verification commands without re-executing agents'
     if action=='workspace': return 'read persisted conversation workspace'
     if action=='set_workspace': return 'validate path whitelist and persist conversation workspace'
     if action=='clear_workspace': return 'reset persisted conversation workspace'
@@ -211,6 +215,13 @@ _ACTIVE_TASK_STATUSES = {
     'ANALYZING', 'WAITING_FOR_CLARIFICATION', 'WAITING_FOR_APPROVAL', 'QUEUED',
     'EXECUTING', 'VERIFYING', 'REPAIRING', 'WAITING_FOR_HUMAN', 'COMPLETED',
 }
+# 只有这些状态的任务才允许把普通消息强制绑定为“补充”：
+# WAITING_FOR_HUMAN 多为验收修复耗尽或高风险待批的滞留任务，强制绑定会把
+# 用户的新提问/新需求吞进旧任务（见 TASK-000005 事故），因此不参与绑定。
+_SUPPLEMENT_BINDABLE_STATUSES = {
+    'ANALYZING', 'WAITING_FOR_CLARIFICATION', 'WAITING_FOR_APPROVAL', 'QUEUED',
+    'EXECUTING', 'VERIFYING', 'REPAIRING',
+}
 
 
 def _clarification_binding(active_task,text):
@@ -244,6 +255,7 @@ def _active_task_context():
                 'title': task.title,
                 'description': task.description,
                 'project_path': task.project_path,
+                'supplement_bindable': task.status in _SUPPLEMENT_BINDABLE_STATUSES,
             }
     except Exception as e:
         logger.warning('failed to load active task context: %s',e)
@@ -501,6 +513,12 @@ def parse_message(text):
     if m: return {'action':'reject','task_id':m.group(1).upper(),'reason':(m.group(2) or '').strip() or None}
     if re.fullmatch(r'(?:通过|批准|同意|approve|yes)',low): return {'action':'approve','task_id':'LATEST'}
     if re.fullmatch(r'(?:驳回|拒绝|reject|no)(?:\s+.+)?',t,re.I|re.S): return {'action':'reject','task_id':'LATEST','reason':re.sub(r'^\s*(?:驳回|拒绝|reject|no)\s*','',t,flags=re.I).strip() or None}
+    m=re.match(r'^(?:重试|retry)\s+(task-(?:[0-9a-z一-鿿][0-9a-z一-鿿_-]*-)?\d{6})$',low)
+    if m: return {'action':'retry','task_id':m.group(1).upper()}
+    if low in ('重试','重试任务','retry'): return {'action':'retry','task_id':'LATEST'}
+    m=re.match(r'^(?:重新验收|再次验收|重跑验收|reverify)\s+(task-(?:[0-9a-z一-鿿][0-9a-z一-鿿_-]*-)?\d{6})$',low)
+    if m: return {'action':'reverify','task_id':m.group(1).upper()}
+    if low in ('重新验收','再次验收','重跑验收'): return {'action':'reverify','task_id':'LATEST'}
     m=re.match(r'^(?:补充|更正|修正)\s+(task-(?:[0-9a-z\u4e00-\u9fff][0-9a-z\u4e00-\u9fff_-]*-)?\d{6})[\s:：]+(.+)$',t,re.I|re.S)
     if m: return {'action':'supplement','task_id':m.group(1).upper(),'requirement':m.group(2).strip()}
     m=re.match(r'^(?:澄清|clarify)\s+(task-(?:[0-9a-z\u4e00-\u9fff][0-9a-z\u4e00-\u9fff_-]*-)?\d{6})[\s:：]+(.+)$',t,re.I|re.S)
@@ -522,6 +540,8 @@ HELP_TEXT='''PersonZit 钉钉用法：
 澄清 <任务ID> <答复>             回复澄清问题（等待澄清时直接回复也可）
 补充 <任务ID> <补充/纠错>        修订当前任务上下文
 状态 <任务ID>                    查询任务
+重试 <任务ID>                    重新规划并执行等待人工的任务（带上全部补充）
+重新验收 <任务ID>                只重跑验收命令，不重新执行 Agent
 运行                            查看 PersonZit 队列和手动 Codex/Claude 会话
 指挥 <EXT会话ID> <修订要求>      指挥手动打开的 Codex/Claude 原会话
 结束 <任务ID> [理由]             取消/终止任务
@@ -544,6 +564,40 @@ def _get_task(db,task_id,statuses=None):
             query=select(Task).where(Task.status.in_(statuses)).order_by(Task.id.desc()).limit(1)
         return db.scalar(query)
     return db.scalar(select(Task).where(Task.public_id==task_id))
+
+def _waiting_human_reason(db,t):
+    """取任务最近一次进入 WAITING_FOR_HUMAN 的原因（真实卡点）。"""
+    for evt in db.scalars(select(EventLog).where(EventLog.task_id==t.id,EventLog.event_type=='TASK_STATUS_CHANGED')
+            .order_by(EventLog.id.desc())).all():
+        try: payload=json.loads(evt.payload_json or '{}')
+        except Exception: payload={}
+        if payload.get('to')=='WAITING_FOR_HUMAN':
+            return str(payload.get('reason') or '等待人工处理')
+    return '等待人工处理'
+
+def _waiting_human_block(db,t):
+    """汇总 WAITING_FOR_HUMAN 任务的真实卡点与下一步指令，替代指向“运行”的环形指引。"""
+    lines=[f'卡点：{_waiting_human_reason(db,t)}']
+    failed=db.scalars(select(VerificationRun).where(VerificationRun.task_id==t.id,VerificationRun.passed==False)
+        .order_by(VerificationRun.id.desc()).limit(2)).all()
+    for run in reversed(failed):
+        try: command=str(json.loads(run.command_json or '""'))
+        except Exception: command=str(run.command_json or '')
+        detail=str(run.summary or '未通过').strip()
+        stderr=''
+        try:
+            if run.stderr_path and Path(run.stderr_path).exists():
+                stderr=Path(run.stderr_path).read_text(encoding='utf-8',errors='replace').strip()
+        except OSError: stderr=''
+        if stderr: detail=f'{detail}（{stderr[-120:]}）'
+        lines.append(f'失败验收：{command} → {detail}')
+    pending_va=db.scalar(select(Approval).where(Approval.task_id==t.id,Approval.approval_type=='VERIFICATION',
+        Approval.status=='PENDING').order_by(Approval.id.desc()))
+    if pending_va:
+        lines.append(f'下一步：回复“通过 {t.public_id}”批准高风险验收命令')
+    else:
+        lines.append(f'下一步：回复“重试 {t.public_id}”重新规划执行，或“重新验收 {t.public_id}”只重跑验收，或“结束 {t.public_id}”取消')
+    return lines
 
 def _job_status_label(status):
     return {'QUEUED':'排队中','RUNNING':'执行中','SUCCEEDED':'已完成','FAILED':'失败','RETRY_WAIT':'等待重试'}.get(str(status or ''),str(status or ''))
@@ -572,14 +626,34 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 jobs=db.scalars(select(Job).where(Job.status.in_(['QUEUED','RUNNING'])).order_by(Job.id.desc()).limit(20)).all()
                 live=process_registry.active_tasks()
                 externals=external_agents.list_external_sessions()
+                active_externals=[r for r in externals if r.get('status')!='COMPLETED'][:10]
+                done_externals=[r for r in externals if r.get('status')=='COMPLETED'][:5]
+                waiting=db.scalars(select(Task).where(Task.status.in_(
+                    ['WAITING_FOR_HUMAN','WAITING_FOR_APPROVAL','WAITING_FOR_CLARIFICATION','PAUSED'])
+                    ).order_by(Task.id.desc()).limit(5)).all()
                 lines=['当前运行链路：']
-                if not jobs and not live and not externals:
+                if not jobs and not live and not active_externals and not waiting:
                     lines.append('没有 QUEUED/RUNNING 队列任务，也没有可监管的本地/手动 Agent 会话。')
-                if externals:
+                if active_externals:
                     lines.append('手动 Codex/Claude 会话：')
-                    for record in externals[:10]:
+                    for record in active_externals:
                         lines.append(f'- {record["external_id"]} [{external_agents._external_status_label(record["status"])}] {record["agent"]} / {(record.get("title") or "")[:100]} / {record.get("workspace") or "未记录目录"}')
                         lines.append(f'  指挥：指挥 {record["external_id"]} <修订要求>')
+                if waiting:
+                    lines.append('等待人工处理的任务：')
+                    for wt in waiting:
+                        if wt.status=='WAITING_FOR_HUMAN':
+                            lines.append(f'- {wt.public_id} {_waiting_human_reason(db,wt)}。可回复“状态 {wt.public_id}”查看卡点，“重试 {wt.public_id}”重新执行')
+                        elif wt.status=='WAITING_FOR_APPROVAL':
+                            lines.append(f'- {wt.public_id} 等待审批。可回复“通过 {wt.public_id}”批准')
+                        elif wt.status=='WAITING_FOR_CLARIFICATION':
+                            lines.append(f'- {wt.public_id} 等待澄清。直接回复答复内容即可')
+                        else:
+                            lines.append(f'- {wt.public_id} 已暂停。可回复“继续执行任务”恢复')
+                if done_externals:
+                    lines.append('近期已完成的手动会话（不再运行）：')
+                    for record in done_externals:
+                        lines.append(f'- {record["external_id"]} [已完成] {record["agent"]} / {(record.get("title") or "")[:60]} / {record.get("workspace") or "未记录目录"}')
                 for job in jobs:
                     task=db.get(Task,job.task_id)
                     if not task: continue
@@ -629,14 +703,15 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 next_actions={
                     'WAITING_FOR_APPROVAL':f'下一步：回复“通过 {t.public_id}”批准执行，或“继续执行任务”',
                     'WAITING_FOR_CLARIFICATION':f'下一步：回复“澄清 {t.public_id} <答复>”',
-                    'WAITING_FOR_HUMAN':'下一步：发送“运行”查看卡在哪个人工节点',
                     'ANALYZING':'下一步：规划中，可稍后发送“运行”查看进度',
                     'QUEUED':'下一步：已排队，可发送“运行”查看 Worker',
                     'EXECUTING':'下一步：执行中，可发送“运行”查看 Agent',
                     'VERIFYING':'下一步：验证中，可发送“运行”查看 Worker',
                     'REPAIRING':'下一步：修复中，可发送“运行”查看 Agent',
                 }
-                if t.status in next_actions: lines.append(next_actions[t.status])
+                if t.status=='WAITING_FOR_HUMAN':
+                    lines+=_waiting_human_block(db,t)
+                elif t.status in next_actions: lines.append(next_actions[t.status])
                 elif t.status in ('CANCELLED','COMPLETED','FAILED'): lines.append('该任务已是终态。')
                 lines+=['子任务：']+[f'- {s.public_id} [{status_label(s.status)}] {s.title}' for s in subs]
                 return '\n'.join(lines)
@@ -678,8 +753,10 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                     transition(db,t,'ANALYZING',actor=actor,reason='dingtalk supplement treated as clarification answer')
                     SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':t.title,'description':t.description,'project_path':t.project_path,'answers':[requirement]},ensure_ascii=False)); db.commit()
                     return f'已把补充内容并入 {t.public_id} 的澄清上下文，正在重新规划；需求明确后会自动进入执行'
-                if t.status in ('WAITING_FOR_HUMAN','PAUSED'):
-                    return f'已记录 {t.public_id} 的补充要求。当前状态为{status_label(t.status)}，需要你按原流程回复后才会继续执行'
+                if t.status=='WAITING_FOR_HUMAN':
+                    return '\n'.join([f'已记录 {t.public_id} 的补充要求，会并入后续执行。当前等待人工处理：',*_waiting_human_block(db,t)])
+                if t.status=='PAUSED':
+                    return f'已记录 {t.public_id} 的补充要求。当前任务已暂停，回复“继续执行任务”可恢复执行'
                 SqliteQueue(db).enqueue('REVISE_TASK',t.id,payload=json.dumps({'requirement':requirement},ensure_ascii=False),priority=100)
                 db.commit()
                 return f'已记录 {t.public_id} 的补充要求，并排入修订队列；当前 Agent 完成本轮后会带新规则重跑相关子任务' if not reopened else f'已重新打开 {t.public_id}，补充规则已入修订队列，将带新规则重跑相关子任务'
@@ -704,7 +781,7 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                         transition(db,t,'VERIFYING',actor=actor,reason='钉钉继续执行并批准高风险验收')
                         SqliteQueue(db).enqueue('VERIFY_SUBTASK',t.id,payload=json.dumps({'approval_id':va.id,'approved_command':command},ensure_ascii=False)); db.commit()
                         return f'{t.public_id} 高风险验收已批准，继续验证'
-                    return f'{t.public_id} 等待人工处理，但不是可自动批准的高风险命令。请发送“运行”查看具体卡点'
+                    return '\n'.join([f'{t.public_id} 等待人工处理：',*_waiting_human_block(db,t)])
                 if t.status=='WAITING_FOR_CLARIFICATION':
                     return f'{t.public_id} 需要先补充澄清信息。请回复：澄清 {t.public_id} <答复>'
                 if t.status=='PAUSED':
@@ -714,6 +791,26 @@ def dispatch_command(cmd,actor='dingtalk',message_id='unknown'):
                 if t.status in ('CANCELLED','COMPLETED','FAILED'):
                     return f'{t.public_id} 已是终态（{status_label(t.status)}），不能继续。可重新发布任务'
                 return f'{t.public_id} 正在{status_label(t.status)}，无需重复触发。可发送“运行”查看详细链路'
+            if action=='retry':
+                t=_get_task(db,cmd.get('task_id') or 'LATEST')
+                if not t: return '没有可重试的任务'
+                if t.status!='WAITING_FOR_HUMAN':
+                    return f'{t.public_id} 当前状态为{status_label(t.status)}，无需重试；仅等待人工处理的任务可重试'
+                t.retry_count=0
+                transition(db,t,'ANALYZING',actor=actor,reason='钉钉重试：带着补充要求重新规划')
+                SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':t.title,'description':t.description,'project_path':t.project_path},ensure_ascii=False))
+                db.commit()
+                _log_route(message_id,stage='task-retry',action='retry',task_id=t.public_id,from_status='WAITING_FOR_HUMAN',to_status='ANALYZING')
+                return f'{t.public_id} 已重新进入规划，将带着全部补充要求重新执行，结果会主动推送'
+            if action=='reverify':
+                t=_get_task(db,cmd.get('task_id') or 'LATEST')
+                if not t: return '没有可重新验收的任务'
+                if t.status!='WAITING_FOR_HUMAN':
+                    return f'{t.public_id} 当前状态为{status_label(t.status)}，无需重新验收'
+                transition(db,t,'VERIFYING',actor=actor,reason='钉钉请求重新验收')
+                SqliteQueue(db).enqueue('VERIFY_SUBTASK',t.id); db.commit()
+                _log_route(message_id,stage='task-reverify',action='reverify',task_id=t.public_id,from_status='WAITING_FOR_HUMAN',to_status='VERIFYING')
+                return f'{t.public_id} 已重新进入验收，结果会主动推送'
             if action=='approve':
                 t=_get_task(db,cmd['task_id'],['WAITING_FOR_APPROVAL','WAITING_FOR_HUMAN'])
                 if not t: return f'未找到待审批任务 {cmd["task_id"]}'
@@ -882,7 +979,7 @@ def start_stream_service():
                             }
                             _log_route(message_id,stage='intent-precheck',text=text,outcome='matched',
                                 parser='clarification-context',action='clarify',task_id=cmd['task_id'])
-                        elif active_task and _looks_like_task_supplement(text):
+                        elif active_task and active_task.get('supplement_bindable') and _looks_like_task_supplement(text):
                             cmd={
                                 'action':'supplement',
                                 'task_id':active_task.get('public_id') or 'LATEST',
@@ -908,7 +1005,7 @@ def start_stream_service():
                         if clarification_reply and action_if_defined(cmd) in ('chat','unknown','create','supplement'):
                             cmd=clarification_reply
                             intent_meta={'provider':'clarification-context-rescue','model':'active-task-context','task_id':cmd['task_id']}
-                        elif action_if_defined(cmd) in ('chat','unknown') and active_task and _looks_like_task_supplement(text):
+                        elif action_if_defined(cmd) in ('chat','unknown') and active_task and active_task.get('supplement_bindable') and _looks_like_task_supplement(text):
                             cmd={'action':'supplement','task_id':active_task.get('public_id') or 'LATEST','requirement':text.strip(),'confidence':0.9}
                             intent_meta={'provider':'task-context-rescue','model':'active-task-context','task_id':cmd['task_id']}
                     intent_duration_ms=round((time.monotonic()-intent_started)*1000)

@@ -110,7 +110,11 @@ def resume(id:str,body:Action=Action(),db:Session=Depends(get_db)):
 @app.post('/api/tasks/{id}/cancel')
 def cancel(id:str,body:Action=Action(),db:Session=Depends(get_db)): return action(id,'CANCEL_REQUESTED',db,body.reason or 'cancel requested')
 @app.post('/api/tasks/{id}/retry')
-def retry(id:str,body:Action=Action(),db:Session=Depends(get_db)): return action(id,'ANALYZING',db,body.reason or 'retry')
+def retry(id:str,body:Action=Action(),db:Session=Depends(get_db)):
+    t=get_task(id,db)
+    if t.status=='WAITING_FOR_HUMAN': t.retry_count=0
+    action(id,'ANALYZING',db,body.reason or 'retry')
+    SqliteQueue(db).enqueue('PLAN_TASK',t.id,payload=json.dumps({'title':t.title,'description':t.description,'project_path':t.project_path},ensure_ascii=False)); db.commit(); return task_dict(t)
 class DingTalkTest(BaseModel): message:str='PersonZit \u9489\u9489\u901a\u77e5\u6d4b\u8bd5'
 @app.get('/api/dingtalk/status')
 def dingtalk_status():

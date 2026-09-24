@@ -9,10 +9,10 @@ import urllib.request
 from .config import load_config
 from .ai_providers import complete_json, complete_text, provider_settings
 
-_ALLOWED_ACTIONS = {'create', 'inspect', 'supplement', 'status', 'running', 'continue', 'cancel', 'workspace', 'set_workspace', 'clear_workspace', 'approve', 'reject', 'clarify', 'list', 'help', 'identity', 'chat', 'unknown'}
-_MUTATING_ACTIONS = {'approve', 'reject', 'clarify', 'cancel', 'supplement'}
+_ALLOWED_ACTIONS = {'create', 'inspect', 'supplement', 'status', 'running', 'continue', 'retry', 'reverify', 'cancel', 'workspace', 'set_workspace', 'clear_workspace', 'approve', 'reject', 'clarify', 'list', 'help', 'identity', 'chat', 'unknown'}
+_MUTATING_ACTIONS = {'approve', 'reject', 'clarify', 'cancel', 'supplement', 'retry', 'reverify'}
 _INTENT_SCHEMA = '''{
-  "action": "create|inspect|supplement|status|running|continue|cancel|workspace|set_workspace|clear_workspace|approve|reject|clarify|list|help|identity|chat|unknown",
+  "action": "create|inspect|supplement|status|running|continue|retry|reverify|cancel|workspace|set_workspace|clear_workspace|approve|reject|clarify|list|help|identity|chat|unknown",
   "requirement": "for create/inspect/supplement: concise request in Chinese",
   "project": "optional project/local path",
   "task_id": "TASK-000001 or LATEST for status only",
@@ -39,10 +39,12 @@ relationship, or field rule related to this task is a supplement, not chat:
 Safety and interpretation rules:
 - create: the current user message asks PersonZit to implement, modify, build, test, or fix something. This action is for work that may change files. Keep the requirement in Chinese and remove polite filler and routing words. Extract a project path only from forms like 项目=D:\path or project=D:\path.
 - inspect: use when the user asks to search, read, list, output, explain, inspect, summarize, or analyze local files, folders, projects, working-directory content, or documents without changing them. Preserve the original local request in requirement; extract an absolute Windows path to project when clearly present. Examples: search a folder, inspect a project, summarize a document.
-- supplement: use when an active task exists and the current message adds a fact, corrects a mistake, clarifies a data relation, or constrains ongoing work (for example: field x of table A refers to field y of table B, not table C). Keep the user full supplement in requirement and use task_id LATEST unless a visible TASK id is present. Do not choose chat for this kind of task-bound declarative update.
+- supplement: use when an active task exists and the current message adds a fact, corrects a mistake, clarifies a data relation, or constrains ongoing work (for example: field x of table A refers to field y of table B, not table C). Keep the user full supplement in requirement and use task_id LATEST unless a visible TASK id is present. Do not choose chat for this kind of task-bound declarative update. Only allowed when the active task context has "supplement_bindable": true; when it is false (task waiting for human handling), a new substantive request is a new create/inspect instead of a supplement.
 - clarify: when the active task status is WAITING_FOR_CLARIFICATION and the current message is a substantive reply (an answer, fact, path, choice, correction, or extra constraint), choose clarify, put the full user reply in answer, and use the active task id. Never turn this reply into chat, a new create task, or a separate supplement unless the user explicitly starts a different task.
 - status: use for task progress questions.
 - continue: use when the user says to continue/resume/run the current task. task_id may be LATEST. task_id may be a visible TASK-xxxxxx, or LATEST when the user refers to the current/latest/recent task.
+- retry: use when the user asks to retry a task that is stuck waiting for human handling (重试/再来一次/重新规划). task_id may be a visible TASK-xxxxxx or LATEST.
+- reverify: use when the user asks to re-run only the verification/acceptance commands of a waiting task (重新验收/再验收一次), without re-executing agents. task_id may be a visible TASK-xxxxxx or LATEST.
 - running: use when the user asks what PersonZit, Codex, Claude, workers, or local agents are currently executing or which tasks are running/queued.
 - workspace: use when the user asks the current DingTalk working directory.
 - set_workspace: use when the user asks to switch/set the DingTalk working directory; project must contain the absolute Windows path.
@@ -147,10 +149,7 @@ def sanitize_intent(raw: dict) -> dict:
             result['answer'] = answer[:4000]
         return result
 
-    if action == 'status':
-        result['task_id'] = _normalize_task_id(raw.get('task_id')) or 'LATEST'
-        return result
-    if action == 'continue':
+    if action in ('status', 'continue', 'retry', 'reverify'):
         result['task_id'] = _normalize_task_id(raw.get('task_id')) or 'LATEST'
         return result
 
@@ -191,6 +190,10 @@ def _heuristic(text: str) -> dict | None:
         return {'action': 'status', 'task_id': 'LATEST', 'confidence': 1.0}
     if re.fullmatch(r'(?:继续|接着|恢复|开始)(?:执行|运行|处理)?(?:当前|最新|这个)?任务(?:吧|呀)?|继续(?:吧|呀)?|go', low):
         return {'action': 'continue', 'task_id': 'LATEST', 'confidence': 1.0}
+    if re.fullmatch(r'(?:重试|retry)(?:任务|这个任务)?(?:吧|呀)?', low):
+        return {'action': 'retry', 'task_id': 'LATEST', 'confidence': 1.0}
+    if re.fullmatch(r'(?:重新|再次|重跑)(?:验收|验证)(?:一下|一次)?', low):
+        return {'action': 'reverify', 'task_id': 'LATEST', 'confidence': 1.0}
     ws_path=re.search(r'[A-Za-z]:[\\/][^\s，。；,;）)]+', value)
     if ws_path and re.search(r'(切换|设置|设定|修改|变更).{0,12}(工作目录|目录|项目)', low):
         return {'action': 'set_workspace', 'project': ws_path.group(0).rstrip('\\"'), 'confidence': 1.0}
@@ -242,10 +245,14 @@ def _heuristic(text: str) -> dict | None:
 def _looks_like_task_supplement(text: str) -> bool:
     """Detect a declarative, task-bound correction without calling another model."""
     value = (text or '').strip()
+    # 剥离钉钉 @提及，避免“@机器人 输出/解释 …”这类提问绕过下面的疑问句判断
+    value = re.sub(r'^@\S+\s*', '', value).strip()
     if len(value) < 8:
         return False
     low = value.lower()
-    if re.search(r'[?？]\s*$|^(?:为什么|怎么|如何|什么是|你是谁|你好|谢谢)', low):
+    if re.search(r'[?？]\s*$|^(?:为什么|怎么|如何|什么是|你是谁|你好|谢谢|输出|说明|解释|列出|查看|看看|总结|分析|评估|告诉我)', low):
+        return False
+    if re.search(r'(什么样的|哪些|哪几个|是不是|对不对|有没有|行不行|怎么样)', low):
         return False
     correction = any(token in low for token in (
         '关联的是', '对应的是', '应该是', '实际是', '正确的是', '不是', '才是',
@@ -260,7 +267,7 @@ def _looks_like_task_supplement(text: str) -> bool:
 
 def _fallback_chat(text: str, history: list[dict] | None, error: str, active_task: dict|None=None) -> tuple[dict, dict]:
     """Degrade an intent-parser failure to safe conversational chat."""
-    if active_task and _looks_like_task_supplement(text):
+    if active_task and active_task.get('supplement_bindable', True) and _looks_like_task_supplement(text):
         return (
             {
                 'action': 'supplement',
@@ -322,6 +329,7 @@ def interpret_intent(text: str, history: list[dict] | None = None, active_task: 
             'status': active_task.get('status'),
             'title': active_task.get('title'),
             'requirement': str(active_task.get('description') or '')[:2000],
+            'supplement_bindable': bool(active_task.get('supplement_bindable', True)),
         }, ensure_ascii=False)
     prompt = _PROMPT % (_INTENT_SCHEMA, history_text, active_context, text or '')
     provider = str(cfg.get('provider', 'local')).lower()

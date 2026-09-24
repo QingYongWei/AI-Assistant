@@ -5,6 +5,11 @@ import app.worker as worker
 class FakeDB:
     def __init__(self): self.objects=[]
     def add(self,value): self.objects.append(value)
+    def scalar(self,query): return None  # 无历史 WORKSPACE_PREPARED 记录
+    def scalars(self,query):
+        class _Empty:
+            def all(self): return []
+        return _Empty()
 
 class FakeRepo:
     def __init__(self, root, workspaces=None, branch='feature/test', created=None):

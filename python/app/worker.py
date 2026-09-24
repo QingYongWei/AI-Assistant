@@ -133,6 +133,20 @@ def _mark_cancelled_agent_run(db,task,run,sub):
         transition(db,task,'CANCELLED',actor='worker',reason='local agent process returned after cancel')
     db.commit(); _task_route(task,'agent-cancelled',subtask=sub.public_id,executor=run.agent_type,outcome='cancelled')
 
+def _reuse_last_workspace(db,task):
+    """复用该任务上次已准备且仍存在的工作区，保留未提交的 Agent 产物。
+
+    workspace.tasks 目录变更后，为修复/重试/重新验收重新创建 worktree 会因
+    分支仍被旧 worktree 检出而失败，退回空目录会让验收误判失败（TASK-000005）。"""
+    evt=db.scalar(select(EventLog).where(EventLog.task_id==task.id,EventLog.event_type=='WORKSPACE_PREPARED')
+        .order_by(EventLog.id.desc()))
+    if not evt: return None
+    try: payload=json.loads(evt.payload_json or '{}')
+    except Exception: return None
+    ws=payload.get('workspace')
+    if not ws or not Path(ws).exists() or not (Path(ws)/'.git').exists(): return None
+    return Path(ws),bool(payload.get('isolated',True))
+
 def ensure_workspace_dir(db,task):
     """默认直接使用项目当前分支；仅在 master 分支创建 Git Worktree 隔离执行。"""
     try:
@@ -147,6 +161,15 @@ def ensure_workspace_dir(db,task):
                     'requested_project':task.project_path,
                 })
                 return repo.root,False
+        reused=_reuse_last_workspace(db,task)
+        if reused:
+            path,isolated=reused
+            log_event(db,task,'WORKSPACE_REUSED',{
+                'mode':'previous-workspace','workspace':str(path),'isolated':isolated,
+                'requested_project':task.project_path,
+                'reason':'reuse previous workspace to preserve uncommitted agent output',
+            })
+            return path,isolated
         path=repo.create(task.public_id)
         task.execution_branch=f'personzit/{task.public_id.lower()}'
         log_event(db,task,'WORKSPACE_SELECTED',{
